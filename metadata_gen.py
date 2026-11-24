@@ -248,9 +248,11 @@ def main():
                          "才能跨盘/跨目录比对(例如 E: 原始树 与 W: 挂载的 ISO "
                          "内部树结构相同但盘符不同)。默认=清单所在目录。")
     ap.add_argument("--append", action="store_true",
-                    help="增量模式：读取已有清单，只计算新增文件的哈希并追加，"
-                         "已记录路径跳过(不读盘)。目标可传目录或具体文件；"
-                         "对具体文件同样是已记录就跳过。清单不存在时等价于全量生成。")
+                    help="显式指定增量模式（默认已是增量，此开关为兼容旧习惯保留）："
+                         "已记录路径跳过(不读盘)，只算新增。")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="强制全量重建清单：忽略已有记录，从头重算并覆盖。"
+                         "用于文件已变更、想重新取基线时。")
     ap.add_argument("--update-one", "--upsert", dest="update_one",
                     action="store_true",
                     help="单文件更新模式：已有记录则核对哈希——相同则清单不变并提示，"
@@ -271,26 +273,28 @@ def main():
     if args.update_one:
         _update_one(args, manifest_path, base_dir)
 
-    # 增量追加：读取已有清单，已记录的路径直接跳过(不读盘)
-    appending = args.append
+    # 清单本身即进度：已记录路径跳过，只补算还没记录的。
+    # 默认增量续算；--rebuild 强制全量重建。--append 保留为显式别名。
+    rebuild = args.rebuild
+    appending = manifest_path.exists() and not rebuild
     existing = {}       # relpath -> 原始整行
     meta = {}
     if appending:
-        if manifest_path.exists():
-            existing, meta = _load_manifest_raw(manifest_path)
-            old_algo = meta.get("algorithm")
-            if old_algo and old_algo != args.algorithm:
-                print(f"[INFO] 追加模式沿用清单算法 {old_algo}（忽略 -a {args.algorithm}）",
-                      file=sys.stderr)
-                args.algorithm = old_algo
-            old_base = meta.get("base")
-            if old_base and old_base != str(base_dir):
-                print(f"[WARN] 清单 base={old_base} 与当前 base={base_dir} 不一致，"
-                      f"相对路径可能对不上；请用相同 --root。", file=sys.stderr)
-            print(f"[INFO] 增量模式：已有 {len(existing)} 条，仅计算新增文件。",
+        existing, meta = _load_manifest_raw(manifest_path)
+        old_algo = meta.get("algorithm")
+        if old_algo and old_algo != args.algorithm:
+            print(f"[INFO] 沿用清单算法 {old_algo}（忽略 -a {args.algorithm}）",
                   file=sys.stderr)
-        else:
-            print(f"[INFO] 清单不存在，按全量生成：{manifest_path}", file=sys.stderr)
+            args.algorithm = old_algo
+        old_base = meta.get("base")
+        if old_base and old_base != str(base_dir):
+            print(f"[WARN] 清单 base={old_base} 与当前 base={base_dir} 不一致，"
+                  f"相对路径可能对不上；请用相同 --root。", file=sys.stderr)
+        print(f"[INFO] 增量续算：已有 {len(existing)} 条，仅计算新增文件。",
+              file=sys.stderr)
+    else:
+        print(f"[INFO] {'全量重建' if rebuild else '全量生成'}: {manifest_path}",
+              file=sys.stderr)
 
     files = iter_files(args.targets, args.follow_symlinks)
     # 排除清单自身、工具脚本
@@ -320,25 +324,38 @@ def main():
         print(f"待哈希 {target_count} 个文件，共 {_fmt_bytes(grand_total)}",
               file=sys.stderr)
 
-    tmp = manifest_path.with_name(manifest_path.name + ".tmp")
+    # 逐条落盘：每算完一个文件立即 flush+fsync，中断也不丢已完成的记录。
+    # 清单里已有的行就是"已完成集合"，无需额外标记。
     count = 0
     skipped = 0
     total_bytes = 0
     read_errors = 0
     t0 = time.time()
     progress_dirty = [False]   # 大文件内部进度是否已写过（决定是否需要清行）
+
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as out:
+        if appending:
+            out = open(manifest_path, "a", encoding="utf-8", newline="\n")
+            # 续写前确认已有内容以换行结尾，避免半截行粘连
+            with open(manifest_path, "rb+") as chk:
+                chk.seek(0, os.SEEK_END)
+                if chk.tell() > 0:
+                    chk.seek(-1, os.SEEK_END)
+                    if chk.read(1) != b"\n":
+                        chk.write(b"\n")
+                        chk.flush()
+                        os.fsync(chk.fileno())
+        else:
+            out = open(manifest_path, "w", encoding="utf-8", newline="\n")
             out.write("# disk-metadata-manifest v1\n")
             out.write(f"# algorithm={args.algorithm}\n")
-            created = (meta.get("created") if appending else None) or \
-                      time.strftime('%Y-%m-%dT%H:%M:%S%z')
-            out.write(f"# created={created}\n")
+            out.write(f"# created={time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n")
             out.write(f"# base={base_dir}\n")
             out.write("# hash\tsize\tmtime\trelpath\n")
-            if appending and existing:
-                for raw in existing.values():
-                    out.write(raw + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+
+        with out:
             for f in files:
                 try:
                     st = f.stat()
@@ -370,6 +387,9 @@ def main():
                     h = file_hash(f, args.algorithm,
                                   progress_cb=_cb if not args.quiet else None)
                     out.write(f"{h}\t{st.st_size}\t{int(st.st_mtime)}\t{rel}\n")
+                    out.flush()
+                    os.fsync(out.fileno())
+                    existing[rel] = True   # 本轮内也去重，防同路径重复
                     count += 1
                     total_bytes += st.st_size
                 except Exception as e:
@@ -393,13 +413,13 @@ def main():
                             f"{_fmt_bytes(speed)}/s | ETA {_fmt_eta(eta)} | {f.name}")
                     sys.stderr.write(line + "\n")
                     sys.stderr.flush()
-            out.flush()
-            os.fsync(out.fileno())
-        _replace_with_retry(tmp, manifest_path)  # 关闭句柄后再原子改名
     except KeyboardInterrupt:
-        if tmp.exists():
-            tmp.unlink()
-        print("\n[ABORT] 已中断，临时文件已清理。", file=sys.stderr)
+        if not args.quiet and progress_dirty[0]:
+            sys.stderr.write("\r" + " " * 100 + "\r")
+        print(f"\n[ABORT] 已中断：本次新增 {count} 条已逐条落盘，清单保留。",
+              file=sys.stderr)
+        print(f"        重新运行同一命令即可接着算（清单里已有的会跳过）。",
+              file=sys.stderr)
         sys.exit(130)
 
     if not args.quiet:

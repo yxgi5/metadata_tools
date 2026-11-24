@@ -74,16 +74,24 @@ python metadata.py verify -m X:\manifest.tsv --root W:\mounted
 
 `--root` 可以指向任意目录，使清单与实际数据分离存放。
 
-## 增量维护清单（`--append`）
+## 增量续算与断点继续（默认行为）
 
-场景：目录里的文件分批增加（例如密文随空间逐步生成），不想每次都对整个目录重算哈希。
+**清单本身就是"已完成集合"**：里面的每一行都是算完并已落盘的记录。`gen` 默认就是增量——
+清单存在就跳过已记录路径、只补算还没有的；清单不存在才全量生成。
+不需要任何额外的断点标记文件。
 
 ```bash
-# 第 1 批：首次全量生成（不加 --append）
+# 第 1 次：清单不存在 -> 全量生成
 python metadata.py gen -m F:\cipher\checksums.tsv F:\cipher
 
-# 第 2 批起：只算新增文件，已有条目原样保留
-python metadata.py gen --append -m F:\cipher\checksums.tsv F:\cipher
+# 之后每次都是增量续算：已有跳过，只算新增（--append 可省略，写上也兼容）
+python metadata.py gen -m F:\cipher\checksums.tsv F:\cipher
+
+# 中途 Ctrl+C 中断：已算的每条都已落盘，直接重跑同一条命令即可接着算
+#     不需要 --append，也不会重复已有条目
+
+# 想强制从头全量重算（如文件已变更、要重建基线）：
+python metadata.py gen --rebuild -m F:\cipher\checksums.tsv F:\cipher
 
 # 校验仍是对整条清单全量校验，用法不变
 python metadata.py verify -m F:\cipher\checksums.tsv
@@ -91,15 +99,13 @@ python metadata.py verify -m F:\cipher\checksums.tsv
 
 要点：
 
-- `--append` 按**相对路径**判断"是否已有"：命中已有路径就跳过，**完全不读该文件**。
-  所以已生成的密文不会再被读一遍，耗时只与新增量成正比。
-- 目标既可以传目录，也可以传**具体文件**。传具体文件时行为相同：
-  清单里已有这个路径就跳过（不核对内容），没有就追加一条。
-- 清单不存在时 `--append` 等价于普通全量生成，不会报错。
-- 追加时沿用清单里记录的算法（`-a` 与之冲突会被忽略并提示）；`created` 保留首次时间。
-- **已有文件被改动不会被 `--append` 发现**——它只看路径新增。检测内容改动是 `verify` 的职责。
-- 跨目录比对时，`gen` 与 `verify` 的 `--root` 必须一致，否则相对路径对不上。
-- 如果文件被删除，`--append` 不会清理清单里的旧条目，需用不带 `--append` 的全量 `gen` 重建。
+- **每条即落盘**：每算完一个文件立即 `flush + fsync` 写入清单，中断只损失当前正在算的那一个。
+- 判断"是否已有"用**相对路径**：命中就跳过，**完全不读该文件**，耗时只与新增量成正比。
+- 目标可传目录或具体文件；具体文件已记录就跳过、没有就追加一条。
+- 续算时沿用清单里的算法与 `created` 时间（`-a` 冲突会被忽略并提示）；`base` 不一致会告警，请用相同 `--root`。
+- **已有文件被改动不会被增量发现**——它只看路径新增。检测改动是 `verify` 的职责，改单条用 `--update-one`。
+- 跨目录比对时，`gen` 与 `verify` 的 `--root` 必须一致。
+- 文件被删除时清单旧条目不会自动清理，用 `--rebuild` 重建。
 
 ## 进度反馈
 
