@@ -50,6 +50,9 @@ python metadata.py verify --quick
 # 只校验清单中的部分路径
 python metadata.py verify D:\photos\subdir
 
+# 增量追加：只计算新文件的哈希，已记录的文件跳过(不读盘)
+python metadata.py gen --append -m X:\manifest.tsv X:\data
+
 # 额外报告磁盘上存在、但清单里没有的文件
 python metadata.py verify --report-extra
 
@@ -70,6 +73,31 @@ python metadata.py verify -m X:\manifest.tsv --root W:\mounted
 ```
 
 `--root` 可以指向任意目录，使清单与实际数据分离存放。
+
+## 增量维护清单（`--append`）
+
+场景：目录里的文件分批增加（例如密文随空间逐步生成），不想每次都对整个目录重算哈希。
+
+```bash
+# 第 1 批：首次全量生成（不加 --append）
+python metadata.py gen -m F:\cipher\checksums.tsv F:\cipher
+
+# 第 2 批起：只算新增文件，已有条目原样保留
+python metadata.py gen --append -m F:\cipher\checksums.tsv F:\cipher
+
+# 校验仍是对整条清单全量校验，用法不变
+python metadata.py verify -m F:\cipher\checksums.tsv
+```
+
+要点：
+
+- `--append` 按**相对路径**判断"是否已有"：命中已有路径就跳过，**完全不读该文件**。
+  所以已生成的密文不会再被读一遍，耗时只与新增量成正比。
+- 清单不存在时 `--append` 等价于普通全量生成，不会报错。
+- 追加时沿用清单里记录的算法（`-a` 与之冲突会被忽略并提示）；`created` 保留首次时间。
+- **已有文件被改动不会被 `--append` 发现**——它只看路径新增。检测内容改动是 `verify` 的职责。
+- 跨目录比对时，`gen` 与 `verify` 的 `--root` 必须一致，否则相对路径对不上。
+- 如果文件被删除，`--append` 不会清理清单里的旧条目，需用不带 `--append` 的全量 `gen` 重建。
 
 ## 清单格式
 
