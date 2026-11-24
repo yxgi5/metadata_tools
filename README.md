@@ -93,11 +93,42 @@ python metadata.py verify -m F:\cipher\checksums.tsv
 
 - `--append` 按**相对路径**判断"是否已有"：命中已有路径就跳过，**完全不读该文件**。
   所以已生成的密文不会再被读一遍，耗时只与新增量成正比。
+- 目标既可以传目录，也可以传**具体文件**。传具体文件时行为相同：
+  清单里已有这个路径就跳过（不核对内容），没有就追加一条。
 - 清单不存在时 `--append` 等价于普通全量生成，不会报错。
 - 追加时沿用清单里记录的算法（`-a` 与之冲突会被忽略并提示）；`created` 保留首次时间。
 - **已有文件被改动不会被 `--append` 发现**——它只看路径新增。检测内容改动是 `verify` 的职责。
 - 跨目录比对时，`gen` 与 `verify` 的 `--root` 必须一致，否则相对路径对不上。
 - 如果文件被删除，`--append` 不会清理清单里的旧条目，需用不带 `--append` 的全量 `gen` 重建。
+
+## 单文件更新：`--update-one` / `--upsert`
+
+当你想针对**某一个**文件刷新校验值时用这个独立开关（与 `--append` 互不干扰）。
+它必须有且只有一个文件参数：
+
+```bash
+# 已有记录 → 重新算哈希并核对
+python metadata.py gen --update-one -m F:\cipher\checksums.tsv F:\securefs_cipher\xxxxxx
+# 别名 --upsert 完全等价
+python metadata.py gen --upsert -m F:\cipher\checksums.tsv F:\securefs_cipher\xxxxxx
+```
+
+三种结果：
+
+| 情形 | 行为 | 输出前缀 |
+| --- | --- | --- |
+| 清单已有该文件，新哈希**相同** | 清单**完全不动**，不产生备份 | `UNCHANGED` |
+| 清单已有该文件，新哈希**不同** | 先把旧清单复制为 `checksums.tsv.bak.<时间戳>`，再只改这一行 | `UPDATED` |
+| 清单中**没有**该文件 | 追加一条新记录（等价于对单文件做 `--append`） | `ADDED` |
+
+要点：
+
+- **只有内容真变了才会备份**，重复运行不会产生一堆 `.bak` 文件。
+- 备份是整份清单的快照（带 `shutil.copy2` 保留时间戳），可随时回滚。
+- 沿用清单里的算法与 `created` 时间；清单不存在时按全量生成处理。
+- 与 `--append` 同时给出时，**`--update-one` 优先**（因为它直接退出，不会走到追加逻辑）。
+- 想核对而不改动清单，用 `verify` 而非本开关：
+  `python metadata.py verify -m F:\cipher\checksums.tsv F:\securefs_cipher\xxxxxx`。
 
 ## 清单格式
 

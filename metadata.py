@@ -24,6 +24,10 @@ metadata.py - 磁盘文件校验和清单的【生成 + 校验】二合一工具
   metadata.py gen D:\\photos      # 扫指定目录
   metadata.py gen a.iso b.iso     # 只记这两个文件
   metadata.py gen -m X:\\my.tsv   # 指定清单位置
+  metadata.py gen --append -m X:\\my.tsv a.iso
+                                 # 增量：a.iso 已有则跳过，无则追加
+  metadata.py gen --update-one -m X:\\my.tsv a.iso
+                                 # 单文件更新：相同不变/不同备份后改/无则追加
   metadata.py verify              # 用脚本同目录清单校验全部
   metadata.py verify -m X:\\my.tsv
   metadata.py verify D:\\photos   # 只校验这些路径
@@ -34,6 +38,7 @@ metadata.py - 磁盘文件校验和清单的【生成 + 校验】二合一工具
 import argparse
 import hashlib
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -127,6 +132,100 @@ def _load_manifest_raw(path):
     return entries, meta
 
 
+def _backup_manifest(path, reason):
+    """变更清单前先复制一份带时间戳的备份；返回备份路径。"""
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    backup = path.with_name(f"{path.name}.bak.{stamp}")
+    i = 1
+    while backup.exists():
+        backup = path.with_name(f"{path.name}.bak.{stamp}.{i}")
+        i += 1
+    shutil.copy2(path, backup)
+    print(f"[BACKUP] {reason} -> {backup}", file=sys.stderr)
+    return backup
+
+
+def _write_manifest_lines(path, base_dir, algorithm, created, lines):
+    """按已有行顺序重写清单（upsert/delete 用），原子替换。"""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as out:
+        out.write("# disk-metadata-manifest v1\n")
+        out.write(f"# algorithm={algorithm}\n")
+        out.write(f"# created={created}\n")
+        out.write(f"# base={base_dir}\n")
+        out.write("# hash\tsize\tmtime\trelpath\n")
+        for line in lines:
+            out.write(line + "\n")
+        out.flush()
+        os.fsync(out.fileno())
+    _replace_with_retry(tmp, path)
+
+
+def _update_one(args, manifest_path, base_dir):
+    """单文件 upsert：已有记录则核对，相同不动、不同则备份后更新；无记录则追加。"""
+    targets = [t for t in args.targets if t]
+    if len(targets) != 1:
+        print("[ERROR] --update-one 要求恰好 1 个文件参数。",
+              file=sys.stderr)
+        sys.exit(2)
+    p = Path(targets[0])
+    if not p.is_file():
+        print(f"[ERROR] --update-one 只接受单个文件: {targets[0]}",
+              file=sys.stderr)
+        sys.exit(2)
+    target = p.resolve()
+    try:
+        rel = os.path.relpath(str(target), str(base_dir)).replace(os.sep, "/")
+    except ValueError:
+        print(f"[ERROR] 文件不在 --root 之下: {target}", file=sys.stderr)
+        sys.exit(2)
+
+    existing, meta = {}, {}
+    if manifest_path.exists():
+        existing, meta = _load_manifest_raw(manifest_path)
+        old_algo = meta.get("algorithm")
+        if old_algo and old_algo != args.algorithm:
+            print(f"[INFO] 更新模式沿用清单算法 {old_algo}（忽略 -a {args.algorithm}）",
+                  file=sys.stderr)
+            args.algorithm = old_algo
+        old_base = meta.get("base")
+        if old_base and old_base != str(base_dir):
+            print(f"[WARN] 清单 base={old_base} 与当前 base={base_dir} 不一致，"
+                  f"相对路径可能对不上；请用相同 --root。", file=sys.stderr)
+
+    try:
+        st = target.stat()
+        cur_hash = file_hash(target, args.algorithm)
+    except Exception as e:
+        print(f"[ERROR] 读取失败(可能坏扇区): {target} -> {e}", file=sys.stderr)
+        sys.exit(1)
+    new_line = f"{cur_hash}\t{st.st_size}\t{int(st.st_mtime)}\t{rel}"
+
+    if rel in existing:
+        old_line = existing[rel]
+        old_hash = old_line.split("\t")[0]
+        if cur_hash == old_hash:
+            print(f"UNCHANGED\t{rel}\t与原校验一致（清单未改动）")
+            sys.exit(0)
+        # 校验变化：备份 -> 替换该行
+        _backup_manifest(manifest_path, f"校验变化: {rel}")
+        lines = [new_line if v == old_line else v for v in existing.values()]
+        print(f"UPDATED\t{rel}\t旧={old_hash[:16]}... 新={cur_hash[:16]}...")
+    else:
+        lines = list(existing.values()) + [new_line]
+        print(f"ADDED\t{rel}\t清单原无记录，已追加")
+
+    created = meta.get("created") or time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        _write_manifest_lines(manifest_path, base_dir, args.algorithm,
+                              created, lines)
+    except Exception as e:
+        print(f"[ERROR] 写清单失败: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"[INFO] 清单已更新: {manifest_path}", file=sys.stderr)
+    sys.exit(0)
+
+
 def cmd_gen(args):
     script_path = Path(__file__).resolve()
     script_dir = script_path.parent
@@ -134,6 +233,10 @@ def cmd_gen(args):
                      if args.manifest else script_dir / DEFAULT_MANIFEST)
     base_dir = (Path(args.root).resolve() if args.root
                 else manifest_path.parent)
+
+    # 单文件 upsert：独立开关 --update-one；与 --append 语义完全分开
+    if getattr(args, "update_one", False):
+        _update_one(args, manifest_path, base_dir)
 
     # 增量追加：读取已有清单，已记录的路径直接跳过(不读盘)
     appending = getattr(args, "append", False)
@@ -358,7 +461,13 @@ def main():
                         "才能跨盘/跨目录比对。默认=清单所在目录。")
     g.add_argument("--append", action="store_true",
                    help="增量模式：读取已有清单，只计算新增文件的哈希并追加，"
-                        "已记录路径跳过(不读盘)。清单不存在时等价于全量生成。")
+                        "已记录路径跳过(不读盘)。目标可传目录或具体文件；"
+                        "对具体文件同样是已记录就跳过。清单不存在时等价于全量生成。")
+    g.add_argument("--update-one", "--upsert", dest="update_one",
+                   action="store_true",
+                   help="单文件更新模式：已有记录则核对哈希——相同则清单不变并提示，"
+                        "不同则先备份原清单再更新；无记录则追加。"
+                        "需恰好一个文件参数；与 --append 同用时本模式优先。")
     g.add_argument("--quiet", "-q", action="store_true", help="关闭进度输出")
     g.set_defaults(func=cmd_gen)
 
