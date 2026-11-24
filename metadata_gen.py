@@ -50,15 +50,35 @@ def _replace_with_retry(src, dst, tries=5):
     raise last
 
 
-def file_hash(path, algo):
+def file_hash(path, algo, progress_cb=None):
     h = hashlib.new(algo)
+    last_tick = time.time()
     with open(path, "rb") as f:
         while True:
             b = f.read(CHUNK)
             if not b:
                 break
             h.update(b)
+            if progress_cb and time.time() - last_tick >= 1.0:
+                progress_cb(f.tell())
+                last_tick = time.time()
     return h.hexdigest()
+
+
+def _fmt_bytes(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f}{unit}"
+        n /= 1024
+
+
+def _fmt_eta(sec):
+    if sec < 60:
+        return f"{sec:.0f}秒"
+    if sec < 3600:
+        return f"{int(sec // 60)}分{int(sec % 60):02d}秒"
+    return f"{int(sec // 3600)}小时{int((sec % 3600) // 60):02d}分"
 
 
 def iter_files(targets, follow_symlinks):
@@ -284,12 +304,29 @@ def main():
               f"{'（增量追加）' if appending else ''}", file=sys.stderr)
         print(f"清单将写入: {manifest_path}", file=sys.stderr)
 
+    # 预先统计本次真正需要哈希的文件数与总字节数，用于百分比和 ETA
+    target_count = 0
+    grand_total = 0
+    if not args.quiet:
+        for pf in files:
+            try:
+                rel_p = os.path.relpath(str(pf), str(base_dir)).replace(os.sep, "/")
+                if appending and rel_p in existing:
+                    continue
+                grand_total += pf.stat().st_size
+                target_count += 1
+            except Exception:
+                pass
+        print(f"待哈希 {target_count} 个文件，共 {_fmt_bytes(grand_total)}",
+              file=sys.stderr)
+
     tmp = manifest_path.with_name(manifest_path.name + ".tmp")
     count = 0
     skipped = 0
     total_bytes = 0
     read_errors = 0
     t0 = time.time()
+    progress_dirty = [False]   # 大文件内部进度是否已写过（决定是否需要清行）
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as out:
             out.write("# disk-metadata-manifest v1\n")
@@ -317,18 +354,45 @@ def main():
                     if rel.startswith(".."):
                         print(f"[WARN] 路径在清单基准之外(将含 ..): {rel}",
                               file=sys.stderr)
-                    h = file_hash(f, args.algorithm)
+
+                    def _cb(done, _f=f, _st=st):
+                        progress_dirty[0] = True
+                        el2 = time.time() - t0
+                        sp2 = (total_bytes + done) / el2 if el2 > 0 else 0
+                        pct2 = done / _st.st_size * 100 if _st.st_size else 0
+                        sys.stderr.write(
+                            f"\r  |-{_f.name}: {_fmt_bytes(done)}"
+                            f"/{_fmt_bytes(_st.st_size)} ({pct2:.0f}%) "
+                            f"{_fmt_bytes(sp2)}/s"
+                        )
+                        sys.stderr.flush()
+
+                    h = file_hash(f, args.algorithm,
+                                  progress_cb=_cb if not args.quiet else None)
                     out.write(f"{h}\t{st.st_size}\t{int(st.st_mtime)}\t{rel}\n")
                     count += 1
                     total_bytes += st.st_size
                 except Exception as e:
+                    if not args.quiet and progress_dirty[0]:
+                        sys.stderr.write("\r" + " " * 100 + "\r")
+                        progress_dirty[0] = False
                     print(f"[ERROR] 读取失败(可能坏扇区): {f} -> {e}",
                           file=sys.stderr)
                     read_errors += 1
-                if not args.quiet and count and count % 500 == 0:
+                if not args.quiet:
+                    if progress_dirty[0]:
+                        sys.stderr.write("\r" + " " * 100 + "\r")
+                        progress_dirty[0] = False
                     el = time.time() - t0
-                    print(f"  {count} 新文件 / {total_bytes/1e9:.1f} GB "
-                          f"/ {el:.0f}s ...", file=sys.stderr)
+                    speed = total_bytes / el if el > 0 else 0
+                    remain = max(0, grand_total - total_bytes)
+                    eta = remain / speed if speed > 0 else 0
+                    pct = count / target_count * 100 if target_count else 100.0
+                    line = (f"[{count:4d}/{target_count:4d}] {pct:5.1f}% | "
+                            f"{_fmt_bytes(total_bytes)}/{_fmt_bytes(grand_total)} | "
+                            f"{_fmt_bytes(speed)}/s | ETA {_fmt_eta(eta)} | {f.name}")
+                    sys.stderr.write(line + "\n")
+                    sys.stderr.flush()
             out.flush()
             os.fsync(out.fileno())
         _replace_with_retry(tmp, manifest_path)  # 关闭句柄后再原子改名
@@ -342,7 +406,7 @@ def main():
         msg = f"完成: 新增 {count} 文件"
         if appending:
             msg += f"，跳过 {skipped} 个已有"
-        msg += f", {total_bytes/1e9:.2f} GB -> {manifest_path}"
+        msg += f", {_fmt_bytes(total_bytes)} -> {manifest_path}"
         print(msg, file=sys.stderr)
     if read_errors:
         print(f"[SUMMARY] {read_errors} 个文件读取失败(见上)，"
