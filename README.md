@@ -32,6 +32,19 @@ python metadata_verify.py
 
 ## 常用示例
 
+最常用的完整流程：**在 F: 生成清单（清单也放 F:，root 指向 F: 盘根），日后数据挪到 H: 后用同一份清单校验（root 换成 H: 盘根）**。
+
+```bash
+# 生成：清单 F:\cipher_checksums.tsv，数据 F:\securefs_cipher
+# root 填 F:\ —— 清单里记的是相对盘根的路径 securefs_cipher\...
+python D:\repos\metadata_tools_git\metadata.py gen -m F:\cipher_checksums.tsv --root F:\ F:\securefs_cipher
+
+# 校验：数据已挪到 H:\securefs_cipher，root 换 H:\（层级不变，只换盘符）
+python D:\repos\metadata_tools_git\metadata.py verify -m F:\cipher_checksums.tsv --root H:\ H:\securefs_cipher
+```
+
+其他示例：
+
 ```bash
 # 扫描指定目录 / 指定多个文件
 python metadata.py gen D:\photos
