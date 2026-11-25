@@ -459,55 +459,115 @@ def cmd_verify(args):
         print(f"载入 {len(entries)} 条, 算法={algo}, 基准={base_dir}",
               file=sys.stderr)
 
-    target_rels = None
+    # 目标过滤：既接受磁盘绝对路径，也接受清单里的相对路径(相对 base_dir)。
+    # 相对路径同时按 cwd 解析一次，兼容两种直觉写法。
+    target_abs = None
     if args.targets:
-        target_rels = set()
+        target_abs = set()
         for t in args.targets:
             p = Path(t)
-            if not p.is_absolute():
-                p = Path.cwd() / p
-            target_rels.add(p.resolve())
+            if p.is_absolute():
+                target_abs.add(p.resolve())
+            else:
+                target_abs.add((base_dir / t).resolve())
+                target_abs.add((Path.cwd() / t).resolve())
 
-    ok = miss = mismatch = error = 0
+    todo = []
     for (h, sz, mt, rel) in entries:
         fp = Path(base_dir) / rel
-        if target_rels is not None:
+        if target_abs is not None:
             fr = fp.resolve()
-            if not any(fr == t or _under(fr, t) for t in target_rels):
+            if not any(fr == ta or _under(fr, ta) for ta in target_abs):
                 continue
+        todo.append((h, sz, mt, rel, fp))
+
+    if args.targets and not todo:
+        print("[ERROR] 指定的目标在清单中没有匹配项。", file=sys.stderr)
+        print("        可传磁盘绝对路径(如 H:\\securefs_cipher\\a.bin)、"
+              "清单相对路径(如 securefs_cipher/a.bin)或目录。", file=sys.stderr)
+        sys.exit(2)
+
+    grand_total = sum(sz for (_h, sz, _mt, _rel, _fp) in todo)
+    target_count = len(todo)
+    if not args.quiet:
+        print(f"待校验 {target_count} 条，共 {_fmt_bytes(grand_total)}",
+              file=sys.stderr)
+
+    ok = miss = mismatch = error = 0
+    done_bytes = 0
+    t0 = time.time()
+    progress_dirty = [False]   # 大文件内部进度是否已写过(决定是否清行)
+
+    def _progress(idx, rel):
+        if args.quiet:
+            return
+        if progress_dirty[0]:
+            sys.stderr.write("\r" + " " * 100 + "\r")
+            progress_dirty[0] = False
+        el = time.time() - t0
+        speed = done_bytes / el if el > 0 else 0
+        remain = max(0, grand_total - done_bytes)
+        eta = remain / speed if speed > 0 else 0
+        pct = idx / target_count * 100 if target_count else 100.0
+        line = (f"[{idx:4d}/{target_count:4d}] {pct:5.1f}% | "
+                f"{_fmt_bytes(done_bytes)}/{_fmt_bytes(grand_total)} | "
+                f"{_fmt_bytes(speed)}/s | ETA {_fmt_eta(eta)} | {rel}")
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+    for idx, (h, sz, mt, rel, fp) in enumerate(todo, 1):
         if not fp.exists():
             print(f"MISSING\t{rel}")
             miss += 1
-            continue
-        try:
-            st = fp.stat()
-            if args.quick:
-                if int(st.st_size) == sz and int(st.st_mtime) == mt:
+        else:
+            try:
+                st = fp.stat()
+                matched = False
+                if args.quick:
+                    matched = (int(st.st_size) == sz and int(st.st_mtime) == mt)
+                    if not matched:
+                        print(f"CHANGED\t{rel}")
+                        mismatch += 1
+                elif int(st.st_size) != sz:
+                    print(f"MISMATCH(size)\t{rel}")
+                    mismatch += 1
+                else:
+                    def _cb(done, _f=fp, _sz=sz):
+                        progress_dirty[0] = True
+                        el2 = time.time() - t0
+                        sp2 = (done_bytes + done) / el2 if el2 > 0 else 0
+                        p2 = done / _sz * 100 if _sz else 0
+                        sys.stderr.write(
+                            f"\r  |-{_f.name}: {_fmt_bytes(done)}"
+                            f"/{_fmt_bytes(_sz)} ({p2:.0f}%) {_fmt_bytes(sp2)}/s"
+                        )
+                        sys.stderr.flush()
+
+                    cur = file_hash(fp, algo,
+                                    progress_cb=_cb if not args.quiet else None)
+                    if progress_dirty[0]:
+                        sys.stderr.write("\r" + " " * 100 + "\r")
+                        progress_dirty[0] = False
+                    if cur == h:
+                        matched = True
+                    else:
+                        print(f"MISMATCH(hash)\t{rel}")
+                        mismatch += 1
+                if matched:
                     if not args.quiet:
                         print(f"OK\t{rel}")
                     ok += 1
-                else:
-                    print(f"CHANGED\t{rel}")
-                    mismatch += 1
-                continue
-            if int(st.st_size) != sz:
-                print(f"MISMATCH(size)\t{rel}")
-                mismatch += 1
-                continue
-            cur = file_hash(fp, algo)
-            if cur != h:
-                print(f"MISMATCH(hash)\t{rel}")
-                mismatch += 1
-                continue
-            if not args.quiet:
-                print(f"OK\t{rel}")
-            ok += 1
-        except Exception as e:
-            print(f"ERROR(read fail, 可能坏扇区)\t{rel}\t-> {e}")
-            error += 1
+            except Exception as e:
+                if not args.quiet and progress_dirty[0]:
+                    sys.stderr.write("\r" + " " * 100 + "\r")
+                    progress_dirty[0] = False
+                print(f"ERROR(read fail, 可能坏扇区)\t{rel}\t-> {e}")
+                error += 1
+        done_bytes += sz          # MISSING 也计入进度，避免 ETA 卡住
+        _progress(idx, rel)
 
     if args.report_extra:
-        manifest_rels = {e[3] for e in entries}
+        manifest_rels = {e[3] for e in todo}
         extra = 0
         for root, dirs, names in os.walk(base_dir):
             for n in names:

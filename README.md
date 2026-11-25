@@ -148,21 +148,52 @@ python metadata.py verify -m F:\cipher\checksums.tsv
 
 ## 进度反馈
 
-`gen` 默认输出实时进度，`-q` / `--quiet` 可完全静默：
+`gen` 和 `verify` 默认都输出实时进度，`-q` / `--quiet` 可完全静默（verify 下仍打印异常项）：
 
 ```
+# gen
 扫描到 235 个文件，算法=sha256
 清单将写入: F:\cipher_checksums.tsv
 待哈希 235 个文件，共 18.7GB
 [   1/ 235]   0.4% | 81.2MB/18.7GB | 45.2MB/s | ETA 7分02秒 | xxxxxx.bin
   |-bigfile.bin: 1.3GB/2.0GB (67%) 1.3GB/s     ← 单个大文件内部每秒刷新
 [   2/ 235]   0.9% | ...
+
+# verify（结果在 stdout，进度在 stderr）
+载入 238 条, 算法=sha256, 基准=H:\
+待校验 238 条，共 18.7GB
+[   1/ 238]   0.4% | 81.2MB/18.7GB | 45.2MB/s | ETA 7分02秒 | securefs_cipher/a.bin
+  |-a.bin: 1.3GB/2.0GB (67%) 1.3GB/s           ← 单个大文件内部每秒刷新
 ```
 
 - 每个文件完成输出一行：序号/总数、百分比、已处理/总字节、当前速度、ETA、文件名。
 - 单个大文件每 1 秒刷新一次内部百分比，同一行覆盖显示，不会看起来"卡住"。
-- 总量在扫描阶段一次汇总；`--append` 时只统计真正需要哈希的新文件，跳过的不计入。
+- 总量在处理前一次汇总；`verify` 传 target 时只统计命中的条目。
 - ETA 按已读字节速度估算（密文文件大小差异大，按文件数估时不准）。
+- `verify` 的结果行（`OK` / `MISSING` / `MISMATCH` / `ERROR`）仍走 stdout，进度走 stderr，方便重定向分离。
+
+## 只校验部分文件（`verify` 传 target）
+
+`verify` 后面可以直接跟**具体文件或目录**，只校验清单中命中的条目；没传则校验全部。
+两种路径写法都支持：
+
+```bash
+# 清单相对路径（清单里记的是什么就写什么）
+python metadata.py verify -m F:\cipher_checksums.tsv --root H:\ securefs_cipher\xxxxxx.bin
+
+# 磁盘绝对路径（文件在盘上的实际位置）
+python metadata.py verify -m F:\cipher_checksums.tsv --root H:\ H:\securefs_cipher\xxxxxx.bin
+
+# 传目录：校验该目录下所有清单条目
+python metadata.py verify -m F:\cipher_checksums.tsv --root H:\ H:\securefs_cipher
+
+# 只核对不改动清单；--quiet 时 OK 不打印，只输出异常项
+python metadata.py verify --quiet -m F:\cipher_checksums.tsv --root H:\ H:\securefs_cipher\xxxxxx.bin
+```
+
+- 目标没匹配到任何清单条目会明确报错并退出码 `2`，不会静默校验 0 条却显示成功。
+- 传目录时按前缀匹配其下所有条目；传具体文件只校验这一个。
+- 校验始终只读，不会改动清单；要改单条校验值用 `--update-one`。
 
 ## 单文件更新：`--update-one` / `--upsert`
 
