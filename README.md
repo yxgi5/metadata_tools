@@ -63,16 +63,55 @@ python metadata.py verify -q
 
 完整参数见 `python metadata.py gen --help`、`python metadata.py verify --help`。
 
-## 跨盘 / 跨目录比对（`--root`）
+## `--root` 是什么（最容易踩的坑）
 
-清单里记录的是**相对路径**，基准默认等于清单所在目录。若要对比两棵结构相同、位置不同的目录树（例如原始盘 `E:` 与挂载成盘符的 ISO 内部树 `W:`），生成和校验时都要用同一个 `--root`：
+**`--root` 是清单里相对路径的起点，不是数据目录本身。** 脚本拼文件路径时用的是：
+
+```
+真实路径 = <--root> + <清单里的相对路径>
+```
+
+清单里的相对路径长什么样，由 gen 时的 `--root` 决定；verify 要给出**同一层级**的起点，盘符或位置可以不同。
+
+**怎么判断该填哪个目录**：看清单数据行的第一段，它对应真实文件系统里的哪一层，`--root` 就指向那一层的**上一级**。
+
+| 清单里的相对路径 | 数据实际位置 | verify 该用的 `--root` |
+| --- | --- | --- |
+| `sub/a.bin` | `E:\source\sub\a.bin` | `E:\source` |
+| `a.bin` | `F:\cipher\a.bin` | `F:\cipher` |
+| `securefs_cipher/a.bin` | `H:\securefs_cipher\a.bin` | `H:\` |
+
+**真实案例**（密文从 F: 挪到 H: 后校验）：清单里是 `securefs_cipher/.securefs.json`，第一段 `securefs_cipher` 是真实存在的目录，所以起点是盘根：
 
 ```bash
+# 正确：H:\ + securefs_cipher\.securefs.json -> H:\securefs_cipher\.securefs.json
+python metadata.py verify -m F:\cipher_checksums.tsv --root H:\
+
+# 错误：H:\securefs_cipher + securefs_cipher\... -> 多拼一层，全部 MISSING
+python metadata.py verify -m F:\cipher_checksums.tsv --root H:\securefs_cipher
+```
+
+**自查**：清单头部 `# base=...` 就是 gen 时的起点，跨盘时只换盘符、层级不变：
+
+```bash
+head -n 6 F:\cipher_checksums.tsv     # 看 # base= 那行
+```
+
+不写 `--root` 时，基准 = **清单文件所在目录**。所以清单放 `F:\`、gen 扫 `F:\cipher` 时，清单路径是 `cipher/...`，verify 在 F: 上不写 root 也能对上；数据换到 H: 后就必须显式写 `--root H:\`。
+
+### 跨盘 / 跨目录比对的完整例子
+
+两棵树结构相同、位置不同时（原始树 `E:\source` 与挂载成盘符的 ISO 内部树 `W:\mounted`）：
+
+```bash
+# gen：扫 E:\source，基准也设为 E:\source -> 清单路径形如 sub/a.bin（不含 source 这一层）
 python metadata.py gen  -m X:\manifest.tsv --root E:\source E:\source
+
+# verify：W:\mounted 与 E:\source 结构相同 -> 基准设为 W:\mounted
 python metadata.py verify -m X:\manifest.tsv --root W:\mounted
 ```
 
-`--root` 可以指向任意目录，使清单与实际数据分离存放。
+注意这里 `--root` 恰好等于目标目录，是因为清单路径**不含**顶层目录名（`sub/a.bin`）。如果清单路径**含**顶层目录名（像上面的 `securefs_cipher/a.bin`），root 就必须退一级到父目录——这正是原来那段例子容易让人误解的地方。
 
 ## 增量续算与断点继续（默认行为）
 
@@ -104,7 +143,7 @@ python metadata.py verify -m F:\cipher\checksums.tsv
 - 目标可传目录或具体文件；具体文件已记录就跳过、没有就追加一条。
 - 续算时沿用清单里的算法与 `created` 时间（`-a` 冲突会被忽略并提示）；`base` 不一致会告警，请用相同 `--root`。
 - **已有文件被改动不会被增量发现**——它只看路径新增。检测改动是 `verify` 的职责，改单条用 `--update-one`。
-- 跨目录比对时，`gen` 与 `verify` 的 `--root` 必须一致。
+- 跨盘/跨目录比对时，`verify` 的 `--root` 与 gen 时的基准要**层级一致**（盘符可换），并且永远指向清单相对路径的起点，不是数据目录本身。详见上面的对照表。
 - 文件被删除时清单旧条目不会自动清理，用 `--rebuild` 重建。
 
 ## 进度反馈
@@ -189,6 +228,6 @@ python metadata.py gen --upsert -m F:\cipher\checksums.tsv F:\securefs_cipher\xx
 ## 使用建议
 
 - **清单和数据分开放**：清单存到另一块盘或云端，避免和数据一起丢失。
-- ** `--root` 前后一致**：gen 与 verify 必须用同一个基准，否则相对路径对不上。
+- **`--root` 是清单相对路径的起点**（通常是数据目录的**父目录**，不是数据目录本身）；gen 与 verify 层级必须一致、盘符可不同。填错会拼出多一层的路径，表现为全部 `MISSING`。详见上面的对照表与案例。
 - **年度校验先用 `--quick` 粗筛**，可疑项再全量校验，节省时间。
 - 校验只负责**发现问题**，不负责保全数据——重要文件仍需多份副本。

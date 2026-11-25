@@ -8,8 +8,11 @@ metadata.py - 磁盘文件校验和清单的【生成 + 校验】二合一工具
   verify   依据清单校验文件完整性
 
 设计要点(相比“只记 sha256”):
-    1. 路径用【相对路径】；基准默认=清单文件所在目录，可用 --root 指定为任意
-       目录，从而支持跨盘/跨目录比对(gen/verify 须用同一 --root)。
+    1. 路径用【相对路径】；--root 是相对路径的起点(不是数据目录本身)，
+       默认=清单文件所在目录。真实路径 = root + 清单相对路径。
+       gen/verify 的层级必须一致(盘符可不同)。
+       例: 清单记 securefs_cipher/a.bin、数据在 H:\\securefs_cipher\\a.bin,
+           则 --root 应为 H:\\ (不是 H:\\securefs_cipher)。
     2. 全程 UTF-8，正确处理中文/特殊文件名。
     3. 大文件分块(4MB)读取，内存恒定。
     4. 单文件读取失败(坏扇区)只告警并跳过，不中断整轮。
@@ -541,8 +544,11 @@ def main():
     g.add_argument("--follow-symlinks", action="store_true",
                    help="跟随符号链接(默认不跟随，避免循环)")
     g.add_argument("--root", default=None,
-                   help="相对路径基准目录。gen 与 verify 必须用同一个 root "
-                        "才能跨盘/跨目录比对。默认=清单所在目录。")
+                   help="清单相对路径的起点(不是数据目录本身)："
+                        "真实路径 = root + 清单相对路径。默认=清单所在目录。"
+                        "gen/verify 层级须一致，盘符可不同。"
+                        "例: 清单记 securefs_cipher/a.bin、数据在 H:\\securefs_cipher\\a.bin"
+                        " -> 用 --root H:\\")
     g.add_argument("--append", action="store_true",
                    help="显式指定增量模式（默认已是增量，此开关为兼容旧习惯保留）："
                         "已记录路径跳过(不读盘)，只算新增。")
@@ -569,8 +575,11 @@ def main():
     v.add_argument("--report-extra", action="store_true",
                    help="额外扫描磁盘、报告清单中没有的文件")
     v.add_argument("--root", default=None,
-                   help="目标树的结构根目录。必须与 gen 时用的 --root 一致。"
-                        "默认=清单所在目录。")
+                   help="清单相对路径的起点(通常是数据目录的父目录，不是数据目录本身)："
+                        "真实路径 = root + 清单相对路径。默认=清单所在目录。"
+                        "必须与 gen 时的 root 层级一致(盘符可换)。"
+                        "例: 清单记 securefs_cipher/a.bin、数据在 H:\\securefs_cipher\\a.bin"
+                        " -> 用 --root H:\\；填 H:\\securefs_cipher 会全部 MISSING。")
     v.add_argument("--quiet", action="store_true", help="只输出异常项")
     v.set_defaults(func=cmd_verify)
 

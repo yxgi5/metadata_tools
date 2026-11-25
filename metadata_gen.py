@@ -9,9 +9,11 @@ metadata_gen.py - 为目录/文件生成校验和清单 (manifest)
     生成 checksum 清单；之后每年通电跑一次 metadata_verify.py，即可发现静默损坏。
 
 相比“只记 sha256”的改进点：
-    1. 路径用【相对路径】；基准默认=清单文件所在目录，可用 --root 指定为任意
-       目录，从而支持跨盘/跨目录比对(如 E: 原始树 与 W: 挂载的 ISO 内部树，
-       只要结构相同、盘符不同即可比对)。
+    1. 路径用【相对路径】；--root 是相对路径的起点(不是数据目录本身)，
+       默认=清单文件所在目录。真实路径 = root + 清单相对路径。
+       gen/verify 层级须一致、盘符可不同(如 E: 原始树 vs W: 挂载的 ISO 内部树)。
+       例: 清单记 securefs_cipher/a.bin、数据在 H:\\securefs_cipher\\a.bin,
+           则 --root 应为 H:\\ (不是 H:\\securefs_cipher)。
     2. 全程 UTF-8，正确处理中文/特殊文件名(如 [DKGirl御女郎])。
     3. 大文件分块(4MB)读取，内存恒定，不爆内存。
     4. 单文件读取失败(坏扇区)只告警并跳过，不中断整轮扫描。
@@ -244,9 +246,11 @@ def main():
     ap.add_argument("--follow-symlinks", action="store_true",
                     help="跟随符号链接(默认不跟随，避免循环)")
     ap.add_argument("--root", default=None,
-                    help="相对路径基准目录。gen 与 verify 必须用同一个 root "
-                         "才能跨盘/跨目录比对(例如 E: 原始树 与 W: 挂载的 ISO "
-                         "内部树结构相同但盘符不同)。默认=清单所在目录。")
+                    help="清单相对路径的起点(不是数据目录本身)："
+                         "真实路径 = root + 清单相对路径。默认=清单所在目录。"
+                         "gen/verify 层级须一致，盘符可不同。"
+                         "例: 清单记 securefs_cipher/a.bin、数据在 H:\\securefs_cipher\\a.bin"
+                         " -> 用 --root H:\\")
     ap.add_argument("--append", action="store_true",
                     help="显式指定增量模式（默认已是增量，此开关为兼容旧习惯保留）："
                          "已记录路径跳过(不读盘)，只算新增。")
